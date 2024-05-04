@@ -1,310 +1,342 @@
-/*
- * libgit2 "log" example - shows how to walk history and get commit info
- *
- * Written by the libgit2 contributors
- *
- * To the extent possible under law, the author(s) have dedicated all copyright
- * and related and neighboring rights to this software to the public domain
- * worldwide. This software is distributed without any warranty.
- *
- * You should have received a copy of the CC0 Public Domain Dedication along
- * with this software. If not, see
- * <http://creativecommons.org/publicdomain/zero/1.0/>.
- */
+use {
+    crate::{
+        db::{Database, Event},
+        PluginData,
+    },
+    chrono::{DateTime, Duration, FixedOffset, TimeZone, Utc},
+    futures::{StreamExt, TryStreamExt},
+    git2::Repository,
+    mongodb::{bson::doc, options::FindOptions},
+    serde::{Deserialize, Serialize},
+    std::{path::{Path, PathBuf}, thread},
+    tokio::fs::read_dir,
+    types::{
+        api::{AvailablePlugins, CompressedEvent},
+        timing::Timing,
+    },
+};
 
-#![deny(warnings)]
-
-use clap::Parser;
-use git2::{Commit, DiffOptions, ObjectType, Repository, Signature, Time};
-use git2::{DiffFormat, Error, Pathspec};
-use std::str;
-
-#[derive(Parser)]
-struct Args {
-    #[structopt(name = "topo-order", long)]
-    /// sort commits in topological order
-    flag_topo_order: bool,
-    #[structopt(name = "date-order", long)]
-    /// sort commits in date order
-    flag_date_order: bool,
-    #[structopt(name = "reverse", long)]
-    /// sort commits in reverse
-    flag_reverse: bool,
-    #[structopt(name = "author", long)]
-    /// author to sort by
-    flag_author: Option<String>,
-    #[structopt(name = "committer", long)]
-    /// committer to sort by
-    flag_committer: Option<String>,
-    #[structopt(name = "pat", long = "grep")]
-    /// pattern to filter commit messages by
-    flag_grep: Option<String>,
-    #[structopt(name = "dir", long = "git-dir")]
-    /// alternative git directory to use
-    flag_git_dir: Option<String>,
-    #[structopt(name = "skip", long)]
-    /// number of commits to skip
-    flag_skip: Option<usize>,
-    #[structopt(name = "max-count", short = 'n', long)]
-    /// maximum number of commits to show
-    flag_max_count: Option<usize>,
-    #[structopt(name = "merges", long)]
-    /// only show merge commits
-    flag_merges: bool,
-    #[structopt(name = "no-merges", long)]
-    /// don't show merge commits
-    flag_no_merges: bool,
-    #[structopt(name = "no-min-parents", long)]
-    /// don't require a minimum number of parents
-    flag_no_min_parents: bool,
-    #[structopt(name = "no-max-parents", long)]
-    /// don't require a maximum number of parents
-    flag_no_max_parents: bool,
-    #[structopt(name = "max-parents")]
-    /// specify a maximum number of parents for a commit
-    flag_max_parents: Option<usize>,
-    #[structopt(name = "min-parents")]
-    /// specify a minimum number of parents for a commit
-    flag_min_parents: Option<usize>,
-    #[structopt(name = "patch", long, short)]
-    /// show commit diff
-    flag_patch: bool,
-    #[structopt(name = "commit")]
-    arg_commit: Vec<String>,
-    #[structopt(name = "spec", last = true)]
-    arg_spec: Vec<String>,
+#[derive(Deserialize)]
+struct ConfigData {
+    pub repo_folder: PathBuf,
 }
 
-fn run(args: &Args) -> Result<(), Error> {
-    let path = args.flag_git_dir.as_ref().map(|s| &s[..]).unwrap_or(".");
-    let repo = Repository::open(path)?;
-    let mut revwalk = repo.revwalk()?;
+pub struct Plugin {
+    plugin_data: PluginData,
+    config: ConfigData,
+}
 
-    // Prepare the revwalk based on CLI parameters
-    let base = if args.flag_reverse {
-        git2::Sort::REVERSE
-    } else {
-        git2::Sort::NONE
-    };
-    revwalk.set_sorting(
-        base | if args.flag_topo_order {
-            git2::Sort::TOPOLOGICAL
-        } else if args.flag_date_order {
-            git2::Sort::TIME
-        } else {
-            git2::Sort::NONE
-        },
-    )?;
-    for commit in &args.arg_commit {
-        if commit.starts_with('^') {
-            let obj = repo.revparse_single(&commit[1..])?;
-            revwalk.hide(obj.id())?;
-            continue;
-        }
-        let revspec = repo.revparse(commit)?;
-        if revspec.mode().contains(git2::RevparseMode::SINGLE) {
-            revwalk.push(revspec.from().unwrap().id())?;
-        } else {
-            let from = revspec.from().unwrap().id();
-            let to = revspec.to().unwrap().id();
-            revwalk.push(to)?;
-            if revspec.mode().contains(git2::RevparseMode::MERGE_BASE) {
-                let base = repo.merge_base(from, to)?;
-                let o = repo.find_object(base, Some(ObjectType::Commit))?;
-                revwalk.push(o.id())?;
-            }
-            revwalk.hide(from)?;
+impl crate::Plugin for Plugin {
+    async fn new(data: PluginData) -> Self
+    where
+        Self: Sized,
+    {
+        let config: ConfigData = toml::Value::try_into(
+            data.config
+                .clone()
+                .expect("Failed to init git plugin! No config was provided!"),
+        )
+        .unwrap_or_else(|e| {
+            panic!(
+                "Unable to init git plugin! Provided config does not fit the requirements: {}",
+                e
+            )
+        });
+
+        Plugin {
+            plugin_data: data,
+            config,
         }
     }
-    if args.arg_commit.is_empty() {
-        revwalk.push_head()?;
+
+    fn get_type() -> types::api::AvailablePlugins
+    where
+        Self: Sized,
+    {
+        types::api::AvailablePlugins::timeline_plugin_git
     }
 
-    // Prepare our diff options and pathspec matcher
-    let (mut diffopts, mut diffopts2) = (DiffOptions::new(), DiffOptions::new());
-    for spec in &args.arg_spec {
-        diffopts.pathspec(spec);
-        diffopts2.pathspec(spec);
-    }
-    let ps = Pathspec::new(args.arg_spec.iter())?;
+    fn request_loop<'a>(
+        &'a self,
+    ) -> std::pin::Pin<Box<dyn futures::Future<Output = Option<chrono::Duration>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            if let Err(e) = self.update_commits().await {
+                self.plugin_data
+                    .report_error_string(format!("Unable to update playing status: {}", e))
+            }
 
-    // Filter our revwalk based on the CLI parameters
-    macro_rules! filter_try {
-        ($e:expr) => {
-            match $e {
-                Ok(t) => t,
-                Err(e) => return Some(Err(e)),
-            }
-        };
-    }
-    let revwalk = revwalk
-        .filter_map(|id| {
-            let id = filter_try!(id);
-            let commit = filter_try!(repo.find_commit(id));
-            let parents = commit.parents().len();
-            if parents < args.min_parents() {
-                return None;
-            }
-            if let Some(n) = args.max_parents() {
-                if parents >= n {
-                    return None;
-                }
-            }
-            if !args.arg_spec.is_empty() {
-                match commit.parents().len() {
-                    0 => {
-                        let tree = filter_try!(commit.tree());
-                        let flags = git2::PathspecFlags::NO_MATCH_ERROR;
-                        if ps.match_tree(&tree, flags).is_err() {
-                            return None;
-                        }
-                    }
-                    _ => {
-                        let m = commit.parents().all(|parent| {
-                            match_with_parent(&repo, &commit, &parent, &mut diffopts)
-                                .unwrap_or(false)
-                        });
-                        if !m {
-                            return None;
-                        }
-                    }
-                }
-            }
-            if !sig_matches(&commit.author(), &args.flag_author) {
-                return None;
-            }
-            if !sig_matches(&commit.committer(), &args.flag_committer) {
-                return None;
-            }
-            if !log_message_matches(commit.message(), &args.flag_grep) {
-                return None;
-            }
-            Some(Ok(commit))
+            Some(Duration::try_minutes(15).unwrap())
         })
-        .skip(args.flag_skip.unwrap_or(0))
-        .take(args.flag_max_count.unwrap_or(!0));
+    }
 
-    // print!
-    for commit in revwalk {
-        let commit = commit?;
-        print_commit(&commit);
-        if !args.flag_patch || commit.parents().len() > 1 {
-            continue;
-        }
-        let a = if commit.parents().len() == 1 {
-            let parent = commit.parent(0)?;
-            Some(parent.tree()?)
-        } else {
-            None
-        };
-        let b = commit.tree()?;
-        let diff = repo.diff_tree_to_tree(a.as_ref(), Some(&b), Some(&mut diffopts2))?;
-        diff.print(DiffFormat::Patch, |_delta, _hunk, line| {
-            match line.origin() {
-                ' ' | '+' | '-' => print!("{}", line.origin()),
-                _ => {}
+    fn get_compressed_events(
+        &self,
+        query_range: &types::timing::TimeRange,
+    ) -> std::pin::Pin<
+        Box<
+            dyn futures::Future<Output = types::api::APIResult<Vec<types::api::CompressedEvent>>>
+                + Send,
+        >,
+    > {
+        let filter = Database::combine_documents(
+            Database::generate_find_plugin_filter(Plugin::get_type()),
+            Database::combine_documents(
+                Database::generate_range_filter(query_range),
+                doc! {
+                        "event.event_type": "Game"
+                },
+            ),
+        );
+        let database = self.plugin_data.database.clone();
+        Box::pin(async move {
+            let mut cursor = database
+                .get_events::<DatabaseCommit>()
+                .find(filter, None)
+                .await?;
+            let mut result = Vec::new();
+            while let Some(v) = cursor.next().await {
+                let t = v?;
+                result.push(CompressedEvent {
+                    title: t.event.repository_name.clone(),
+                    time: t.timing,
+                    data: Box::new(t.event),
+                })
             }
-            print!("{}", str::from_utf8(line.content()).unwrap());
-            true
-        })?;
-    }
 
-    Ok(())
+            Ok(result)
+        })
+    }
 }
 
-fn sig_matches(sig: &Signature, arg: &Option<String>) -> bool {
-    match *arg {
-        Some(ref s) => {
-            sig.name().map(|n| n.contains(s)).unwrap_or(false)
-                || sig.email().map(|n| n.contains(s)).unwrap_or(false)
+impl Plugin {
+    async fn update_commits(&self) -> Result<(), String> {
+        let mut dirs = match read_dir(&self.config.repo_folder).await {
+            Ok(v) => v,
+            Err(e) => return Err(format!("Unable to read repositories directory: {}", e)),
+        };
+
+        while let Some(entry) = match dirs.next_entry().await {
+            Ok(v) => v,
+            Err(e) => {
+                return Err(format!("Unable to read repositories directory: {}", e));
+            }
+        } {
+            let entry_type = match entry.file_type().await {
+                Ok(v) => v,
+                Err(e) => {
+                    return Err(format!(
+                        "Unable to check directory entry for file-type: {}",
+                        e
+                    ));
+                }
+            };
+
+            if entry_type.is_dir() {
+                self.get_commits_in_repo(&entry.path()).await?;
+            }
         }
-        None => true,
+
+        Ok(())
     }
-}
 
-fn log_message_matches(msg: Option<&str>, grep: &Option<String>) -> bool {
-    match (grep, msg) {
-        (&None, _) => true,
-        (&Some(_), None) => false,
-        (&Some(ref s), Some(msg)) => msg.contains(s),
+    async fn get_commits_in_repo(&self, path: &Path) -> Result<(), String> {
+        let repo_name = match path.file_name() {
+            Some(v) => match v.to_str() {
+                Some(v) => v.to_string(),
+                None => {
+                    return Err("Unable to read os-string to internal string.".to_string());
+                }
+            },
+            None => {
+                return Err(
+                    "Unable to identify repository name. There is no last path component.".to_string());
+            }
+        };
+
+        let path = path.to_owned();
+
+        let handle = thread::spawn(move || {
+            let repo = match Repository::open(&path) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Err(format!(
+                        "Unable to read repository: \nPath: {} \nError: {}",
+                        path.display(),
+                        e
+                    ));
+                }
+            };
+
+            let mut walk = match repo.revwalk() {
+                Ok(v) => v,
+                Err(e) => {
+                    return Err(format!(
+                        "Unable to read commits of repository: \nPath: {} \nError: {}",
+                        path.display(),
+                        e
+                    ))
+                }
+            };
+
+            match (walk.set_sorting(git2::Sort::TIME), walk.push_head()) {
+                (Ok(_), Ok(_)) => {}
+                (Err(e), Err(e_2)) => {
+                    return Err(format!("Was unable to set sorting and append head to revwalk. \nPath: {} \nError Sorting: {} \nError Head: {}", path.display(), e, e_2));
+                }
+                (Err(e), _) => {
+                    return Err(format!(
+                        "Was unable to set sorting: \nPath: {} \nError: {}",
+                        path.display(),
+                        e
+                    ));
+                }
+                (_, Err(e)) => {
+                    return Err(format!(
+                        "Was unable to append head: \nPath: {} \nError: {}",
+                        path.display(),
+                        e
+                    ));
+                }
+            }
+
+            let mut commits: Vec<Commit> = Vec::new();
+
+            for step in walk {
+                let step_id = match step {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return Err(format!(
+                            "Unable to walk along commit graph: \nPath: {} \nError: {}",
+                            path.display(),
+                            e
+                        ));
+                    }
+                };
+
+                let commit = match repo.find_commit(step_id) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return Err(format!("Unable to find a commit from revwalk in repository: \nPath: {} \nError: {}", path.display(), e));
+                    }
+                };
+
+                let msg = match commit.message() {
+                    Some(v) => v,
+                    None => {
+                        return Err(format!(
+                            "Unable to read commit message: \nPath: {}",
+                            path.display()
+                        ));
+                    }
+                };
+
+                let time = commit.time();
+
+                let offset = FixedOffset::west_opt(time.offset_minutes() * 60).unwrap();
+                let timestamp = offset.timestamp_millis_opt(time.seconds() * 1000).unwrap();
+                let utc = DateTime::<Utc>::from(timestamp);
+
+                let parsed_commit = Commit {
+                    id: step_id.to_string(),
+                    message: msg.to_string(),
+                    time: utc,
+                    repository_name: repo_name.clone(),
+                    author: commit.author().to_string(),
+                };
+
+                commits.push(parsed_commit);
+            }
+
+            Ok(commits)
+        });
+
+        let commits = match handle.join() {
+            Ok(v) => match v {
+                Ok(v) => v,
+                Err(e) => return Err(e)
+            },
+            Err(e) => {
+                return Err(format!("Unable to join handle on update thread: {:?}", e))
+            }
+        };
+
+        self.insert_new_commits_into_database(&commits).await
     }
-}
 
-fn print_commit(commit: &Commit) {
-    println!("commit {}", commit.id());
+    async fn insert_new_commits_into_database(&self, commits: &Vec<Commit>) -> Result<(), String> {
+        let ids: Vec<&str> = commits.iter().map(|v| v.id.as_str()).collect();
 
-    if commit.parents().len() > 1 {
-        print!("Merge:");
-        for id in commit.parent_ids() {
-            print!(" {:.8}", id);
+        let already_inserted_commits: Vec<String> = match self
+            .plugin_data
+            .database
+            .get_events::<()>()
+            .find(
+                Database::combine_documents(
+                    Database::generate_find_plugin_filter(AvailablePlugins::timeline_plugin_git),
+                    doc! {
+                        "event.id": {
+                            "$in": ids
+                        }
+                    },
+                ),
+                FindOptions::builder().projection(doc! {"id": 1}).build(),
+            )
+            .await
+        {
+            Ok(v) => match v.try_collect::<Vec<Event<()>>>().await {
+                Ok(v) => v.into_iter().map(|v| v.id).collect(),
+                Err(e) => {
+                    return Err(format!(
+                        "Unable to collect all already existing commits: {}",
+                        e
+                    ));
+                }
+            },
+            Err(e) => {
+                return Err(format!("Error loading commit ids from database: {}", e));
+            }
+        };
+
+        let mut insert = Vec::new();
+
+        for commit in commits {
+            if !already_inserted_commits.contains(&commit.id) {
+                insert.push(CommitEvent {
+                    timing: Timing::Instant(commit.time),
+                    id: commit.id.clone(),
+                    plugin: AvailablePlugins::timeline_plugin_git,
+                    event: DatabaseCommit {
+                        author: commit.author.clone(),
+                        message: commit.message.clone(),
+                        repository_name: commit.repository_name.clone(),
+                    },
+                })
+            }
         }
-        println!();
-    }
 
-    let author = commit.author();
-    println!("Author: {}", author);
-    print_time(&author.when(), "Date:   ");
-    println!();
-
-    for line in String::from_utf8_lossy(commit.message_bytes()).lines() {
-        println!("    {}", line);
-    }
-    println!();
-}
-
-fn print_time(time: &Time, prefix: &str) {
-    let (offset, sign) = match time.offset_minutes() {
-        n if n < 0 => (-n, '-'),
-        n => (n, '+'),
-    };
-    let (hours, minutes) = (offset / 60, offset % 60);
-    let ts = time::Timespec::new(time.seconds() + (time.offset_minutes() as i64) * 60, 0);
-    let time = time::at(ts);
-
-    println!(
-        "{}{} {}{:02}{:02}",
-        prefix,
-        time.strftime("%a %b %e %T %Y").unwrap(),
-        sign,
-        hours,
-        minutes
-    );
-}
-
-fn match_with_parent(
-    repo: &Repository,
-    commit: &Commit,
-    parent: &Commit,
-    opts: &mut DiffOptions,
-) -> Result<bool, Error> {
-    let a = parent.tree()?;
-    let b = commit.tree()?;
-    let diff = repo.diff_tree_to_tree(Some(&a), Some(&b), Some(opts))?;
-    Ok(diff.deltas().len() > 0)
-}
-
-impl Args {
-    fn min_parents(&self) -> usize {
-        if self.flag_no_min_parents {
-            return 0;
+        if let Err(e) = self.plugin_data.database.register_events(&insert).await {
+            return Err(format!("Unable to insert into Database: {}", e));
         }
-        self.flag_min_parents
-            .unwrap_or(if self.flag_merges { 2 } else { 0 })
-    }
 
-    fn max_parents(&self) -> Option<usize> {
-        if self.flag_no_max_parents {
-            return None;
-        }
-        self.flag_max_parents
-            .or(if self.flag_no_merges { Some(1) } else { None })
+        Ok(())
     }
 }
 
-fn main() {
-    let args = Args::parse();
-    match run(&args) {
-        Ok(()) => {}
-        Err(e) => println!("error: {}", e),
-    }
+#[derive(Debug, Clone)]
+struct Commit {
+    id: String,
+    message: String,
+    author: String,
+    time: DateTime<Utc>,
+    repository_name: String,
 }
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct DatabaseCommit {
+    message: String,
+    author: String,
+    repository_name: String,
+}
+
+type CommitEvent = Event<DatabaseCommit>;
