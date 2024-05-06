@@ -63,7 +63,7 @@ impl crate::Plugin for Plugin {
         Box::pin(async move {
             if let Err(e) = self.update_commits().await {
                 self.plugin_data
-                    .report_error_string(format!("Unable to update playing status: {}", e))
+                    .report_error_string(format!("Unable to refresh recent commits: {}", e))
             }
 
             Some(Duration::try_minutes(15).unwrap())
@@ -81,12 +81,7 @@ impl crate::Plugin for Plugin {
     > {
         let filter = Database::combine_documents(
             Database::generate_find_plugin_filter(Plugin::get_type()),
-            Database::combine_documents(
-                Database::generate_range_filter(query_range),
-                doc! {
-                        "event.event_type": "Game"
-                },
-            ),
+            Database::generate_range_filter(query_range)
         );
         let database = self.plugin_data.database.clone();
         Box::pin(async move {
@@ -268,38 +263,38 @@ impl Plugin {
         let ids: Vec<&str> = commits.iter().map(|v| v.id.as_str()).collect();
 
         let already_inserted_commits: Vec<String> = match self
-            .plugin_data
-            .database
-            .get_events::<()>()
-            .find(
-                Database::combine_documents(
-                    Database::generate_find_plugin_filter(AvailablePlugins::timeline_plugin_git),
+        .plugin_data
+        .database
+        .get_events::<DatabaseCommit>()
+        .find(
+            Database::combine_documents(
+                Database::generate_find_plugin_filter(AvailablePlugins::timeline_plugin_git),
                     doc! {
-                        "event.id": {
+                        "id": {
                             "$in": ids
                         }
                     },
                 ),
-                FindOptions::builder().projection(doc! {"id": 1}).build(),
+                None,
             )
             .await
-        {
-            Ok(v) => match v.try_collect::<Vec<Event<()>>>().await {
-                Ok(v) => v.into_iter().map(|v| v.id).collect(),
+            {
+                Ok(v) => match v.try_collect::<Vec<Event<DatabaseCommit>>>().await {
+                    Ok(v) => v.into_iter().map(|v| v.id).collect(),
+                    Err(e) => {
+                        return Err(format!(
+                            "Unable to collect all already existing commits: {}",
+                            e
+                        ));
+                    }
+                },
                 Err(e) => {
-                    return Err(format!(
-                        "Unable to collect all already existing commits: {}",
-                        e
-                    ));
+                    return Err(format!("Error loading commit ids from database: {}", e));
                 }
-            },
-            Err(e) => {
-                return Err(format!("Error loading commit ids from database: {}", e));
-            }
-        };
-
+            };
+            
         let mut insert = Vec::new();
-
+            
         for commit in commits {
             if !already_inserted_commits.contains(&commit.id) {
                 insert.push(CommitEvent {
@@ -314,9 +309,10 @@ impl Plugin {
                 })
             }
         }
-
-        if let Err(e) = self.plugin_data.database.register_events(&insert).await {
-            return Err(format!("Unable to insert into Database: {}", e));
+        if !insert.is_empty() {
+            if let Err(e) = self.plugin_data.database.register_events(&insert).await {
+                return Err(format!("Unable to insert into Database: {}", e));
+            }
         }
 
         Ok(())
