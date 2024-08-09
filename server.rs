@@ -6,7 +6,7 @@ use {
     chrono::{DateTime, Duration, FixedOffset, TimeZone, Utc},
     futures::{StreamExt, TryStreamExt},
     git2::Repository,
-    mongodb::{bson::doc, options::FindOptions},
+    mongodb::{bson::doc},
     serde::{Deserialize, Serialize},
     std::{path::{Path, PathBuf}, thread},
     tokio::fs::read_dir,
