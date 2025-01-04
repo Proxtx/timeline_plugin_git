@@ -1,0 +1,9 @@
+[package]
+name = "timeline_plugin_git_server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+server_api = { path = "../../../server_api/" }
+serde = { version = "1.0.215", features = ["derive"] }
+git2 = "0.18.3"
